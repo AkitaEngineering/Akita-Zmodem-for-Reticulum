@@ -13,7 +13,7 @@ import argparse
 import threading
 import stat # For file mode constants and conversion
 import Reticulum as R
-from Reticulum.Utilities.misc import ifac_pretty_str # For logging if needed
+
 
 # Akita Zmodem constants
 AKITA_APP_NAME = "akita_zmodem"
@@ -66,9 +66,9 @@ AKITA_ESCCTL = 0x40      # Receiver expects ctl chars to be escaped
 AKITA_ESC8 = 0x80        # Receiver expects 8th bit to be escaped
 
 # Length constants
-ZMODEM_HEADER_LENGTH_BIN = 9     # ZPAD + ZDLE + ZBIN + type(1) + data_val(4) + crc16(2)
+ZMODEM_HEADER_LENGTH_BIN = 10     # ZPAD + ZDLE + ZBIN + type(1) + data_val(4) + crc16(2)
 ZMODEM_SUBPACKET_DATA_PREFIX_LEN = 2 # ZDLE + ZBIN for ZFILE info subpacket
-ZMODEM_SUBPACKET_DATA_SUFFIX_LEN = 3 # ZDLE + ZCRCW + crc16(2) for ZFILE info subpacket
+ZMODEM_SUBPACKET_DATA_SUFFIX_LEN = 4 # ZDLE + ZCRCW + crc16(2) for ZFILE info subpacket (total bytes)
 CRC32_LEN = 4                    # Length of CRC32 checksum in bytes
 
 # CRC functions
@@ -95,41 +95,71 @@ session_use_crc32 = False   # True if CRC32 for ZDATA payloads is negotiated for
 
 # --- ZMODEM Protocol Helper Functions ---
 
-def zmodem_escape(data_bytes):
-    """ZDLE-escapes data. Currently, only ZDLE (0x18) is escaped to ZDLE ZDLEE."""
-    escaped_data = bytearray()
-    for byte in data_bytes:
-        if byte == AKITA_ZDLE[0]:
-            escaped_data.extend(AKITA_ZDLE)
-            escaped_data.extend(AKITA_ZDLEE)
-        # TODO: Add other escapes (XON, XOFF, etc.) here if full ESCCTL/ESC8 support is desired
-        else:
-            escaped_data.append(byte)
-    return bytes(escaped_data)
+def zmodem_escape(data_bytes, esc_ctl=True, esc_8=False):
+    """ZDLE-escapes data following Zmodem conventions.
 
-def zmodem_unescape(escaped_data_bytes):
-    """Un-escapes ZDLE-encoded data."""
-    data_bytes = bytearray()
+    - Always escapes ZDLE (0x18) -> ZDLE ZDLEE.
+    - If esc_ctl is True (default) escapes control characters (< 0x20 and 0x7F)
+      by encoding them as ZDLE + (byte ^ 0x40).
+    - If esc_8 is True also escapes high-bit bytes (>= 0x80) using the same
+      XOR-0x40 transformation (not used by default).
+
+    This mirrors the common Zmodem behaviour and fixes edge-cases where
+    control characters or literal ZDLE bytes would corrupt subpacket parsing.
+    """
+    escaped = bytearray()
+    for b in data_bytes:
+        # Always escape ZDLE by mapping to ZDLE ZDLEE
+        if b == AKITA_ZDLE[0]:
+            escaped.extend(AKITA_ZDLE)
+            escaped.extend(AKITA_ZDLEE)
+            continue
+
+        # Escape control characters (C0) when requested
+        if esc_ctl and (b < 0x20 or b == 0x7f):
+            escaped.extend(AKITA_ZDLE)
+            escaped.append(b ^ 0x40)
+            continue
+
+        # Optionally escape 8th-bit characters (ESC8)
+        if esc_8 and b >= 0x80:
+            escaped.extend(AKITA_ZDLE)
+            escaped.append((b ^ 0x40) & 0xff)
+            continue
+
+        # Default: append unchanged
+        escaped.append(b)
+
+    return bytes(escaped) 
+
+def zmodem_unescape(escaped_data_bytes, esc_8=False):
+    """Reverse ZDLE escaping produced by zmodem_escape.
+
+    - ZDLE ZDLEE -> literal ZDLE
+    - ZDLE <ch> where <ch> != ZDLEE -> original_byte = <ch> ^ 0x40
+
+    esc_8 mirrors the corresponding option in zmodem_escape (kept for symmetry).
+    """
+    data = bytearray()
     i = 0
     while i < len(escaped_data_bytes):
-        if escaped_data_bytes[i] == AKITA_ZDLE[0]:
-            if i + 1 < len(escaped_data_bytes):
-                i += 1
-                if escaped_data_bytes[i] == AKITA_ZDLEE[0]:
-                    data_bytes.extend(AKITA_ZDLE)
-                # TODO: Add other un-escapes here if other characters were escaped
-                else: # This byte itself was the escaped char representation (e.g. ZCRCW)
-                    data_bytes.append(escaped_data_bytes[i]) # This case might be wrong for general unescaping
-                                                             # but works for ZDLEE. A more robust unescaper
-                                                             # would map ZDLE+<char> to <original_char>.
-                                                             # For now, only ZDLEE is handled for data.
-            else:
+        b = escaped_data_bytes[i]
+        if b == AKITA_ZDLE[0]:
+            i += 1
+            if i >= len(escaped_data_bytes):
                 R.log("ZMODEM: Trailing ZDLE in unescape, data may be truncated.", R.LOG_WARNING)
-                break 
+                break
+            nb = escaped_data_bytes[i]
+            if nb == AKITA_ZDLEE[0]:
+                data.append(AKITA_ZDLE[0])
+            else:
+                # Reverse the XOR-0x40 mapping used for escaped bytes
+                orig = nb ^ 0x40
+                data.append(orig & 0xff)
         else:
-            data_bytes.append(escaped_data_bytes[i])
+            data.append(b)
         i += 1
-    return bytes(data_bytes)
+    return bytes(data) 
 
 def build_zmodem_header(frame_type, data_val=0):
     """Builds a simplified Zmodem binary header with CRC16."""
@@ -582,7 +612,7 @@ def run_zmodem_receiver_protocol():
         trailer_start_idx = -1
         # Search for ZDLE ZCRCW trailer from data_payload_start up to where a trailer could fit
         # ZDLE ZCRCW is 2 bytes, CRC16 is 2 bytes. Min length of escaped data is 0.
-        search_end_limit = len(zfile_packet) - (ZMODEM_SUBPACKET_DATA_SUFFIX_LEN - 1) # -1 because ZDLE starts the 3-byte suffix
+        search_end_limit = len(zfile_packet) - (ZMODEM_SUBPACKET_DATA_SUFFIX_LEN - 1) # ensure room for ZDLE+ZCRCW + 2-byte CRC
         for i in range(data_payload_start, search_end_limit): 
             if zfile_packet[i : i + 2] == (AKITA_ZDLE + AKITA_ZCRCW): # ZDLE + 'k'
                 trailer_start_idx = i
@@ -760,7 +790,7 @@ def run_zmodem_receiver_protocol():
                     target_link.send(build_zmodem_header(AKITA_ZACK, receiver_last_written_offset)) # ACK with *new* total bytes received
                     
                     progress = (receiver_last_written_offset / current_file_size) * 100 if current_file_size > 0 else 100.0
-                    sys.stdout.write(f"\rReceiving '{received_filename_base}': {receiver_last_written_offset}/{current_file_size} bytes ({progress:.2f}%%)  ")
+                    sys.stdout.write(f"\rReceiving '{received_filename_base}': {receiver_last_written_offset}/{current_file_size} bytes ({progress:.2f}%)  ")
                     sys.stdout.flush()
 
                 elif pdata_offset < receiver_last_written_offset: 
