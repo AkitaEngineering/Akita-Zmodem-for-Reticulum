@@ -2,7 +2,8 @@
 
 Akita Zmodem for Reticulum is a file transfer utility using a Zmodem-like protocol, designed to operate robustly over the [Reticulum Network Stack](https://reticulum.network/). It facilitates direct file transfers between systems running Reticulum, with a focus on resilience for problematic or low-bandwidth networks. This is achieved by leveraging Reticulum's inherent capabilities for reliable transport and Zmodem's established mechanisms for file transfer management, including resume.
 
-This version is licensed under the GPLv3.
+This project is licensed under the GNU General Public License v3.0 (GPLv3).
+See the full license text in the `LICENSE` file. (SPDX: GPL-3.0-or-later)
 
 ## Features
 
@@ -142,7 +143,7 @@ Both sender and receiver instances require a Reticulum identity.
 ## Notes & Considerations
 
 * **Reticulum Network:** Ensure that a Reticulum network is operational and configured correctly on both the sender and receiver systems, allowing them to communicate. This might involve configuring appropriate interfaces (LoRa, Packet Radio, TCP/IP, UDP/IP, etc.) in your Reticulum configuration file.
-* **Firewalls:** If operating over IP-based Reticulum interfaces (like `TC подземный интерфейс` or `UDP интерфейс`), ensure any firewalls between the sender and receiver allow the necessary traffic for Reticulum to function (typically UDP/TCP on port 4242 by default, unless configured otherwise).
+* **Firewalls:** If operating over IP-based Reticulum interfaces (like TCP/IP or UDP/IP), ensure any firewalls between the sender and receiver allow the necessary traffic for Reticulum to function (typically UDP/TCP on port 4242 by default, unless configured otherwise).
 * **Single Instance Receiver:** The current receiver implementation can handle one incoming transfer at a time. Once a transfer is complete or a link is closed, it becomes ready for a new connection.
 * **Zmodem Simplifications:** While this implementation uses key Zmodem concepts, it is not a full, byte-for-byte compatible Zmodem implementation for all features of the original serial-line protocol. For example, ZDLE escaping is applied to Zmodem protocol control data (like ZFILE info) but not to the raw ZDATA file chunks, as Reticulum Links are expected to provide an 8-bit clean transport.
 * **Logging:** Use the `-v`, `-vv`, or `-vvv` flags for increasing levels of diagnostic output, which can be helpful for troubleshooting. Reticulum's own log level is also influenced by these flags.
