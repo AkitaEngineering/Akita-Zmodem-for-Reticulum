@@ -7,6 +7,7 @@
 import crcmod
 import time
 import os
+import shutil
 import sys
 import json
 import argparse
@@ -86,10 +87,12 @@ is_sender_mode = False       # True if sender, False if receiver
 current_file_size = 0
 current_file_offset = 0      # Tracks file pointer offset for sending
 receive_directory = "~/akita_received_files/"
+receive_conflict_policy = "prompt"
 sender_last_acked_offset = 0
 receiver_last_written_offset = 0
 transfer_active = False
 cancel_transfer_flag = threading.Event()
+shutdown_requested = threading.Event()
 session_use_crc32 = False
 
 # Thread-safe queue for incoming packets on the active link
@@ -269,6 +272,34 @@ def delete_checkpoint(filename_basename):
         RNS.log(f"Error deleting checkpoint {checkpoint_file}: {e}", RNS.LOG_ERROR)
 
 
+def resolve_receive_conflict(filename_basename):
+    """Choose how to handle an existing file that cannot be resumed."""
+    if receive_conflict_policy == "overwrite":
+        RNS.log(f"Receiver: Overwriting existing file '{filename_basename}' by policy.", RNS.LOG_INFO)
+        return "overwrite"
+
+    if receive_conflict_policy == "skip":
+        RNS.log(f"Receiver: Skipping existing file '{filename_basename}' by policy.", RNS.LOG_INFO)
+        return "skip"
+
+    if not sys.stdin or not sys.stdin.isatty():
+        RNS.log(
+            f"Receiver: Existing file '{filename_basename}' cannot be resumed and stdin is not interactive. "
+            "Use --conflict-policy overwrite or skip. Sending ZSKIP.",
+            RNS.LOG_WARNING,
+        )
+        return "skip"
+
+    print(f"File '{filename_basename}' already exists in '{receive_directory}'.")
+    overwrite_choice = input("Overwrite? (y/N): ").strip().lower()
+    if overwrite_choice == 'y':
+        RNS.log("Receiver: User chose to overwrite.", RNS.LOG_INFO)
+        return "overwrite"
+
+    RNS.log("Receiver: User chose not to overwrite. Sending ZSKIP.", RNS.LOG_INFO)
+    return "skip"
+
+
 def _link_repr(link):
     """Return a short string identifying a link for log messages."""
     if link and hasattr(link, 'link_id') and link.link_id:
@@ -279,11 +310,12 @@ def _link_repr(link):
 # --- Reticulum Link Callbacks ---
 
 def client_link_established(link):
-    global target_link, transfer_event, is_sender_mode, transfer_active, session_use_crc32
+    global target_link, transfer_event, is_sender_mode, transfer_active, session_use_crc32, cancel_transfer_flag
     RNS.log(f"Link established to server {_link_repr(link)}", RNS.LOG_INFO)
     target_link = link
     transfer_active = True
     session_use_crc32 = False
+    cancel_transfer_flag.clear()
     while not packet_queue.empty():
         try:
             packet_queue.get_nowait()
@@ -451,7 +483,9 @@ def run_zmodem_sender_protocol():
 
                 chunk_data = f.read(chunk_size)
                 if not chunk_data:
-                    RNS.log("Sender: Read empty chunk unexpectedly.", RNS.LOG_WARNING)
+                    RNS.log("Sender: Source file ended before the advertised size. Aborting.", RNS.LOG_ERROR)
+                    link_send(target_link, build_zmodem_header(AKITA_ZFERR))
+                    cancel_transfer_flag.set()
                     break
 
                 zdata_header = build_zmodem_header(AKITA_ZDATA, current_file_offset)
@@ -464,10 +498,10 @@ def run_zmodem_sender_protocol():
                 if not link_send(target_link, zdata_header + payload_to_send):
                     break
 
-                ack_received_for_current_chunk = False
+                chunk_acked = False
                 ack_retries = 0
                 max_ack_retries = 3
-                while not ack_received_for_current_chunk and ack_retries < max_ack_retries:
+                while not chunk_acked and ack_retries < max_ack_retries:
                     if cancel_transfer_flag.is_set() or not target_link or target_link.status == RNS.Link.CLOSED:
                         break
 
@@ -476,11 +510,10 @@ def run_zmodem_sender_protocol():
                         ack_type, ack_offset_val, _ = parse_zmodem_header(ack_packet)
                         expected_ack_offset = current_file_offset + len(chunk_data)
                         if ack_type == AKITA_ZACK:
-                            if ack_offset_val >= expected_ack_offset or \
-                               (ack_offset_val == current_file_size and expected_ack_offset == current_file_size):
+                            if ack_offset_val == expected_ack_offset:
                                 sender_last_acked_offset = ack_offset_val
                                 current_file_offset += len(chunk_data)
-                                ack_received_for_current_chunk = True
+                                chunk_acked = True
                                 send_retries = 0
                                 break
                             else:
@@ -490,11 +523,11 @@ def run_zmodem_sender_protocol():
                             current_file_offset = ack_offset_val
                             f.seek(current_file_offset)
                             sender_last_acked_offset = ack_offset_val
-                            ack_received_for_current_chunk = True
+                            chunk_acked = True
+                            send_retries = 0
                             break
                         elif ack_type == AKITA_ZNAK:
                             RNS.log("Sender: Received ZNAK. Will resend chunk.", RNS.LOG_WARNING)
-                            ack_received_for_current_chunk = True
                             break
                         elif ack_type == AKITA_ZCAN:
                             RNS.log("Sender: Received ZCAN from receiver. Aborting.", RNS.LOG_INFO)
@@ -506,9 +539,10 @@ def run_zmodem_sender_protocol():
                         RNS.log(f"Sender: Timeout waiting for ZACK. Retry {ack_retries + 1}/{max_ack_retries}", RNS.LOG_WARNING)
                         ack_retries += 1
 
-                if not ack_received_for_current_chunk and not cancel_transfer_flag.is_set():
+                if not chunk_acked and not cancel_transfer_flag.is_set():
                     send_retries += 1
                     RNS.log(f"Sender: Failed to get ACK. Retry {send_retries}/{max_send_retries}", RNS.LOG_ERROR)
+                    f.seek(current_file_offset)
                     if send_retries >= max_send_retries:
                         RNS.log("Sender: Max retries exceeded. Aborting.", RNS.LOG_ERROR)
                         link_send(target_link, build_zmodem_header(AKITA_ZABORT))
@@ -557,7 +591,10 @@ def run_zmodem_sender_protocol():
             pass
     finally:
         if target_link and target_link.status != RNS.Link.CLOSED:
-            target_link.teardown()
+            try:
+                target_link.teardown()
+            except Exception as e_teardown:
+                RNS.log(f"Sender: Error tearing down link: {e_teardown}", RNS.LOG_WARNING)
         target_link = None
         transfer_event.set()
         RNS.log("Sender: Protocol Finished.", RNS.LOG_VERBOSE)
@@ -578,6 +615,22 @@ def run_zmodem_receiver_protocol():
     expected_file_mode = 0
     resumed_transfer = False
     receiver_last_written_offset = 0
+    eof_confirmed = False
+    resync_requests = 0
+    max_resync_requests = 10
+
+    def request_receiver_resync(message, log_level=RNS.LOG_WARNING):
+        nonlocal resync_requests
+
+        resync_requests += 1
+        RNS.log(f"{message} Requesting ZRPOS ({resync_requests}/{max_resync_requests}).", log_level)
+        if resync_requests >= max_resync_requests:
+            RNS.log("Receiver: Max resync attempts exceeded. Aborting transfer.", RNS.LOG_ERROR)
+            link_send(target_link, build_zmodem_header(AKITA_ZABORT))
+            cancel_transfer_flag.set()
+            return False
+
+        return link_send(target_link, build_zmodem_header(AKITA_ZRPOS, receiver_last_written_offset))
 
     try:
         packet = link_receive(timeout=600)
@@ -654,6 +707,8 @@ def run_zmodem_receiver_protocol():
             file_info_str = file_info_bytes_unescaped.decode('utf-8')
             parts = file_info_str.strip('\0').split('\0')
             received_filename_base = os.path.basename(parts[0])
+            if not received_filename_base:
+                raise ValueError("ZFILE filename is empty")
 
             if len(parts) > 1 and parts[1].strip():
                 attrs_str = parts[1].split(' ')
@@ -693,13 +748,10 @@ def run_zmodem_receiver_protocol():
                 RNS.log("Receiver: Checkpoint metadata mismatch. Starting from scratch.", RNS.LOG_WARNING)
                 delete_checkpoint(received_filename_base)
         elif os.path.exists(receive_file_path) and not resumed_transfer:
-            print(f"File '{received_filename_base}' already exists in '{receive_directory}'.")
-            overwrite_choice = input("Overwrite? (y/N): ").strip().lower()
-            if overwrite_choice != 'y':
-                RNS.log("Receiver: User chose not to overwrite. Sending ZSKIP.", RNS.LOG_INFO)
+            conflict_action = resolve_receive_conflict(received_filename_base)
+            if conflict_action == "skip":
                 link_send(target_link, build_zmodem_header(AKITA_ZSKIP))
                 return
-            RNS.log("Receiver: User chose to overwrite.", RNS.LOG_INFO)
             try:
                 if os.path.exists(receive_file_path):
                     os.remove(receive_file_path)
@@ -712,6 +764,22 @@ def run_zmodem_receiver_protocol():
         if not resumed_transfer:
             current_file_offset = 0
             receiver_last_written_offset = 0
+
+        remaining_bytes = max(0, current_file_size - current_file_offset)
+        try:
+            free_bytes = shutil.disk_usage(receive_directory).free
+        except Exception as e_space:
+            RNS.log(f"Receiver: Could not determine free space: {e_space}", RNS.LOG_ERROR)
+            link_send(target_link, build_zmodem_header(AKITA_ZFERR))
+            return
+
+        if free_bytes < remaining_bytes:
+            RNS.log(
+                f"Receiver: Not enough free space for transfer. Need {remaining_bytes} bytes, have {free_bytes}.",
+                RNS.LOG_ERROR,
+            )
+            link_send(target_link, build_zmodem_header(AKITA_ZFERR))
+            return
 
         RNS.log(f"Receiver: Sending ZRPOS with offset {current_file_offset}", RNS.LOG_DEBUG)
         if not link_send(target_link, build_zmodem_header(AKITA_ZRPOS, current_file_offset)):
@@ -739,15 +807,14 @@ def run_zmodem_receiver_protocol():
             link_send(target_link, build_zmodem_header(AKITA_ZFERR))
             return
 
-        while receiver_last_written_offset < current_file_size:
+        while not eof_confirmed:
             if cancel_transfer_flag.is_set() or not target_link or target_link.status == RNS.Link.CLOSED:
                 RNS.log("Receiver: Transfer cancelled or link lost.", RNS.LOG_INFO)
                 break
 
             data_packet = link_receive(timeout=20)
             if not data_packet:
-                RNS.log("Receiver: Timeout waiting for ZDATA. Requesting ZRPOS.", RNS.LOG_WARNING)
-                if not link_send(target_link, build_zmodem_header(AKITA_ZRPOS, receiver_last_written_offset)):
+                if not request_receiver_resync("Receiver: Timeout waiting for ZDATA."):
                     break
                 continue
 
@@ -759,8 +826,7 @@ def run_zmodem_receiver_protocol():
 
                 if session_use_crc32:
                     if len(chunk_with_potential_crc) < CRC32_LEN:
-                        RNS.log("Receiver: ZDATA payload too short for CRC32.", RNS.LOG_ERROR)
-                        if not link_send(target_link, build_zmodem_header(AKITA_ZRPOS, receiver_last_written_offset)):
+                        if not request_receiver_resync("Receiver: ZDATA payload too short for CRC32.", RNS.LOG_ERROR):
                             break
                         continue
 
@@ -769,17 +835,31 @@ def run_zmodem_receiver_protocol():
                     calculated_crc = crc32_func(actual_chunk_data)
 
                     if received_crc != calculated_crc:
-                        RNS.log(f"Receiver: ZDATA CRC32 mismatch at offset {pdata_offset}", RNS.LOG_ERROR)
-                        if not link_send(target_link, build_zmodem_header(AKITA_ZRPOS, receiver_last_written_offset)):
+                        if not request_receiver_resync(
+                            f"Receiver: ZDATA CRC32 mismatch at offset {pdata_offset}.",
+                            RNS.LOG_ERROR,
+                        ):
                             break
                         continue
                 else:
                     actual_chunk_data = chunk_with_potential_crc
 
                 if pdata_offset == receiver_last_written_offset:
+                    if receiver_last_written_offset >= current_file_size:
+                        RNS.log(
+                            f"Receiver: Unexpected extra ZDATA at offset {pdata_offset} after file completion.",
+                            RNS.LOG_WARNING,
+                        )
+                        if not request_receiver_resync(
+                            f"Receiver: Extra ZDATA at offset {pdata_offset} after completion.",
+                        ):
+                            break
+                        continue
+
                     file_handle.write(actual_chunk_data)
                     file_handle.flush()
                     receiver_last_written_offset += len(actual_chunk_data)
+                    resync_requests = 0
                     save_checkpoint(received_filename_base, receiver_last_written_offset, current_file_size, expected_file_mtime, expected_file_mode)
 
                     if not link_send(target_link, build_zmodem_header(AKITA_ZACK, receiver_last_written_offset)):
@@ -791,11 +871,13 @@ def run_zmodem_receiver_protocol():
 
                 elif pdata_offset < receiver_last_written_offset:
                     RNS.log(f"Receiver: Duplicate ZDATA at offset {pdata_offset}", RNS.LOG_DEBUG)
+                    resync_requests = 0
                     if not link_send(target_link, build_zmodem_header(AKITA_ZACK, receiver_last_written_offset)):
                         break
                 else:
-                    RNS.log(f"Receiver: Gap in ZDATA. Expected {receiver_last_written_offset}, got {pdata_offset}", RNS.LOG_WARNING)
-                    if not link_send(target_link, build_zmodem_header(AKITA_ZRPOS, receiver_last_written_offset)):
+                    if not request_receiver_resync(
+                        f"Receiver: Gap in ZDATA. Expected {receiver_last_written_offset}, got {pdata_offset}.",
+                    ):
                         break
 
             elif ptype == AKITA_ZEOF:
@@ -803,10 +885,10 @@ def run_zmodem_receiver_protocol():
                 RNS.log(f"Receiver: ZEOF (reported {eof_offset}). Written: {receiver_last_written_offset}", RNS.LOG_DEBUG)
                 if receiver_last_written_offset == current_file_size and eof_offset == current_file_size:
                     RNS.log("Receiver: Transfer complete.", RNS.LOG_INFO)
+                    eof_confirmed = True
                     link_send(target_link, build_zmodem_header(AKITA_ZRINIT))
                     break
-                RNS.log("Receiver: ZEOF mismatch. Requesting ZRPOS.", RNS.LOG_ERROR)
-                if not link_send(target_link, build_zmodem_header(AKITA_ZRPOS, receiver_last_written_offset)):
+                if not request_receiver_resync("Receiver: ZEOF mismatch.", RNS.LOG_ERROR):
                     break
 
             elif ptype == AKITA_ZCAN or ptype == AKITA_ZABORT:
@@ -814,15 +896,19 @@ def run_zmodem_receiver_protocol():
                 cancel_transfer_flag.set()
                 break
             else:
-                RNS.log(f"Receiver: Unexpected type {ptype}. Requesting ZRPOS.", RNS.LOG_WARNING)
-                if not link_send(target_link, build_zmodem_header(AKITA_ZRPOS, receiver_last_written_offset)):
+                if not request_receiver_resync(f"Receiver: Unexpected type {ptype}."):
                     break
 
         if file_handle:
             file_handle.close()
             file_handle = None
 
-        if cancel_transfer_flag.is_set() and received_filename_base:
+        transfer_completed = (
+            received_filename_base is not None and
+            receiver_last_written_offset == current_file_size
+        )
+
+        if cancel_transfer_flag.is_set() and received_filename_base and not transfer_completed:
             RNS.log(f"Receiver: Transfer for '{received_filename_base}' cancelled. Checkpoint preserved.", RNS.LOG_INFO)
             return
 
@@ -876,7 +962,10 @@ def run_zmodem_receiver_protocol():
         if file_handle:
             file_handle.close()
         if target_link and target_link.status != RNS.Link.CLOSED:
-            target_link.teardown()
+            try:
+                target_link.teardown()
+            except Exception as e_teardown:
+                RNS.log(f"Receiver: Error tearing down link: {e_teardown}", RNS.LOG_WARNING)
         target_link = None
         transfer_event.set()
         RNS.log("Receiver: Protocol Finished.", RNS.LOG_VERBOSE)
@@ -884,9 +973,34 @@ def run_zmodem_receiver_protocol():
 
 # --- Main Application Logic ---
 
+def run_receiver_listener_loop():
+    global target_link, transfer_active
+
+    try:
+        while not shutdown_requested.is_set():
+            if transfer_event.is_set():
+                RNS.log("Receiver: Transfer attempt finished. Resetting.", RNS.LOG_INFO)
+                if target_link and target_link.status != RNS.Link.CLOSED:
+                    RNS.log("Receiver: Forcing teardown of previous link.", RNS.LOG_DEBUG)
+                    target_link.teardown()
+                target_link = None
+                transfer_active = False
+                cancel_transfer_flag.clear()
+                transfer_event.clear()
+                RNS.log("Receiver ready for new connection.", RNS.LOG_INFO)
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("\nCtrl+C detected. Shutting down...")
+        shutdown_requested.set()
+        cancel_transfer_flag.set()
+        if target_link and target_link.status != RNS.Link.CLOSED:
+            target_link.teardown()
+
 def main():
     global reticulum_instance, identity, destination_hash_hex, file_to_send_path
-    global is_sender_mode, receive_directory, transfer_event, cancel_transfer_flag, target_link, transfer_active
+    global is_sender_mode, receive_directory, receive_conflict_policy
+    global transfer_event, cancel_transfer_flag
+    global target_link, transfer_active, shutdown_requested
 
     parser = argparse.ArgumentParser(
         description="Akita Zmodem for Reticulum: File transfer over RNS.",
@@ -901,6 +1015,17 @@ def main():
                         help="Path to the file to send.\nRequired for 'send' mode.")
     parser.add_argument("--recvdir", metavar="PATH", default="~/akita_received_files/",
                         help="Directory to save received files.\n(Default: %(default)s)")
+    parser.add_argument(
+        "--conflict-policy",
+        choices=["prompt", "overwrite", "skip"],
+        default="prompt",
+        help=(
+            "How receiver mode handles an existing destination file when the transfer cannot be resumed.\n"
+            "'prompt' asks when stdin is interactive, otherwise skips.\n"
+            "'overwrite' replaces the existing file. 'skip' sends ZSKIP.\n"
+            "(Default: %(default)s)"
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="Verbosity level:\n  -v INFO, -vv DEBUG, -vvv EXTREME.\n  Default: NOTICE.")
 
@@ -916,6 +1041,7 @@ def main():
         RNS.loglevel = RNS.LOG_NOTICE
 
     receive_directory = os.path.expanduser(args.recvdir)
+    receive_conflict_policy = args.conflict_policy
     try:
         os.makedirs(receive_directory, exist_ok=True)
         RNS.log(f"Receive directory set to: {os.path.abspath(receive_directory)}", RNS.LOG_DEBUG)
@@ -1014,6 +1140,7 @@ def main():
 
     elif args.mode == 'receive':
         is_sender_mode = False
+        shutdown_requested.clear()
         RNS.log("Receiver mode. Setting up listener...", RNS.LOG_INFO)
 
         server_destination = RNS.Destination(
@@ -1034,23 +1161,7 @@ def main():
         print(f"  Received files will be saved in: {os.path.abspath(receive_directory)}")
         print("Press Ctrl+C to stop listening.")
 
-        try:
-            while not cancel_transfer_flag.is_set():
-                if transfer_event.is_set():
-                    RNS.log("Receiver: Transfer attempt finished. Resetting.", RNS.LOG_INFO)
-                    if target_link and target_link.status != RNS.Link.CLOSED:
-                        RNS.log("Receiver: Forcing teardown of previous link.", RNS.LOG_DEBUG)
-                        target_link.teardown()
-                    target_link = None
-                    transfer_active = False
-                    transfer_event.clear()
-                    RNS.log("Receiver ready for new connection.", RNS.LOG_INFO)
-                time.sleep(0.2)
-        except KeyboardInterrupt:
-            print("\nCtrl+C detected. Shutting down...")
-            cancel_transfer_flag.set()
-            if target_link and target_link.status != RNS.Link.CLOSED:
-                target_link.teardown()
+        run_receiver_listener_loop()
 
     RNS.log("Stopping Reticulum...", RNS.LOG_INFO)
     RNS.Reticulum.exit_handler()

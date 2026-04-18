@@ -13,7 +13,7 @@ See the full license text in the `LICENSE` file. (SPDX: GPL-3.0-or-later)
 * **Full File Information:** Transfers filename, size, modification timestamp, and file permissions (mode). These attributes are applied to the received file.
 * **Negotiable 32-bit CRC for Data:** Supports negotiation of 32-bit CRC (CRC32) for ZDATA packet payloads for enhanced data integrity checking at the Zmodem layer, in addition to Reticulum's own checks.
 * **ZDLE Escaping for Protocol Data:** Critical Zmodem protocol data (like the ZFILE information subpacket) is ZDLE-escaped for robustness.
-* **File Overwrite Protection:** Prompts the user before overwriting existing files on the receiver if a transfer cannot be confidently resumed.
+* **Conflict Policy for Existing Files:** If a transfer cannot be resumed and the destination file already exists, the receiver can prompt, overwrite automatically, or skip the file via a CLI flag.
 * **Sender and Receiver Modes:** Clear command-line driven roles.
 * **Persistent Identities:** Uses Reticulum identity files for stable, cryptographic addressing (default: `~/.akili_zmodem_id.key`).
 * **Problematic Network Friendly:** Designed with Reticulum's strengths for challenging network conditions.
@@ -80,6 +80,7 @@ Both sender and receiver instances require a Reticulum identity.
     **Receiver Options:**
     * `-i PATH`, `--identity PATH`: Path to your Reticulum identity file.
     * `--recvdir PATH`: Directory where received files will be saved. (Default: `~/akita_received_files/`)
+    * `--conflict-policy {prompt,overwrite,skip}`: How to handle an existing destination file when the transfer cannot be resumed. `prompt` asks only when stdin is interactive and otherwise skips. (Default: `prompt`)
     * `-v, -vv, -vvv`: Verbosity level for logging (INFO, DEBUG, EXTREME respectively).
 
 2.  **Receiver Information:**
@@ -132,12 +133,21 @@ Both sender and receiver instances require a Reticulum identity.
     ```
     The sender will attempt to connect to the receiver and transfer the file.
 
+**Unattended Receiver Example:**
+
+```bash
+./akita_zmodem_rns.py receive --recvdir /media/shared_drive/transfers/ --conflict-policy overwrite -vv
+```
+
+Use `--conflict-policy overwrite` to replace non-resumable existing files automatically, or `--conflict-policy skip` to leave them untouched and send `ZSKIP` back to the sender.
+
 ## Checkpoints & Transfer Resume
 
 * When a receiver starts downloading a file, it creates a checkpoint file (e.g., `filename.ext.checkpoint`) in the receive directory. This checkpoint stores the filename, expected total size, received offset, modification time, and file mode.
 * If a transfer is interrupted (e.g., network issue, sender/receiver restarted), the Zmodem handshake will occur again upon a new connection attempt for the same file.
 * The receiver will check its checkpoint against the incoming file offer from the sender. If the filename, size, mtime, and mode match, and the local partially received file is consistent with the checkpoint's offset, it will request the sender to resume from the last good offset (`ZRPOS`).
 * The sender will then seek to that offset in its source file and continue sending data.
+* If a checkpoint is missing or does not match, the receiver falls back to `--conflict-policy` when the destination file already exists.
 * Checkpoints are automatically deleted by the receiver upon successful and complete file transfer. If a transfer is aborted or fails partially, the checkpoint remains, allowing for a potential future resume.
 
 ## Notes & Considerations
@@ -145,6 +155,7 @@ Both sender and receiver instances require a Reticulum identity.
 * **Reticulum Network:** Ensure that a Reticulum network is operational and configured correctly on both the sender and receiver systems, allowing them to communicate. This might involve configuring appropriate interfaces (LoRa, Packet Radio, TCP/IP, UDP/IP, etc.) in your Reticulum configuration file.
 * **Firewalls:** If operating over IP-based Reticulum interfaces (like TCP/IP or UDP/IP), ensure any firewalls between the sender and receiver allow the necessary traffic for Reticulum to function (typically UDP/TCP on port 4242 by default, unless configured otherwise).
 * **Single Instance Receiver:** The current receiver implementation can handle one incoming transfer at a time. Once a transfer is complete or a link is closed, it becomes ready for a new connection.
+* **Non-interactive receive mode:** When running the receiver without a TTY, use `--conflict-policy overwrite` or `--conflict-policy skip` to avoid interactive prompts for existing destination files.
 * **Zmodem Simplifications:** While this implementation uses key Zmodem concepts, it is not a full, byte-for-byte compatible Zmodem implementation for all features of the original serial-line protocol. For example, ZDLE escaping is applied to Zmodem protocol control data (like ZFILE info) but not to the raw ZDATA file chunks, as Reticulum Links are expected to provide an 8-bit clean transport.
 * **Logging:** Use the `-v`, `-vv`, or `-vvv` flags for increasing levels of diagnostic output, which can be helpful for troubleshooting. Reticulum's own log level is also influenced by these flags.
 
